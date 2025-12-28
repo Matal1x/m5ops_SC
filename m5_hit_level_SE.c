@@ -2,74 +2,62 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include <gem5/m5ops.h>
 
-#ifndef CACHELINE
 #define CACHELINE 64
-#endif
+#define PAGE      4096
 
-static inline void touch_byte(volatile uint8_t *p)
-{
-    // A volatile load that the compiler cannot remove.
-    (void)*p;
-}
-
-static void thrash(volatile uint8_t *buf, size_t size)
-{
-    // Touch one byte per cache line to create pressure in the cache.
-    for (size_t off = 0; off < size; off += CACHELINE) {
-        touch_byte(buf + off);
-    }
-}
+static inline uint8_t load8(volatile uint8_t *p) { return *p; }
 
 static void print_level(const char *tag)
 {
     uint64_t level = m5_get_last_hit_level();
-    // Your encoding: 0=None, 1=L1_HIT, 2=L2_HIT, 3=MEM_HIT
     printf("%s: last_hit_level=%lu\n", tag, (unsigned long)level);
 }
 
 int main(void)
 {
-    // Choose sizes relative to your config:
-    // L1D = 32 KiB, L2 = 1 MiB (from your setup)
-    const size_t L1_THRASH = 128 * 1024;   // > 32 KiB to evict from L1
-    const size_t L2_THRASH = 4 * 1024 * 1024; // > 1 MiB to evict from L2 (likely)
+    // Allocate 9 pages so we can touch 9 addresses with same L1 set (8-way -> eviction).
+    size_t region_size = 9 * PAGE;
+    volatile uint8_t *region = (volatile uint8_t*)aligned_alloc(PAGE, region_size);
+    if (!region) return 1;
+    memset((void*)region, 0, region_size);
 
-    volatile uint8_t *target = (volatile uint8_t*)aligned_alloc(CACHELINE, CACHELINE);
-    volatile uint8_t *thrash_l1 = (volatile uint8_t*)aligned_alloc(CACHELINE, L1_THRASH);
-    volatile uint8_t *thrash_l2 = (volatile uint8_t*)aligned_alloc(CACHELINE, L2_THRASH);
+    // Choose target at offset 0. Do NOT store to it before the "cold" load.
+    volatile uint8_t *target = region + 0;
 
-    if (!target || !thrash_l1 || !thrash_l2) {
-        printf("alloc failed\n");
-        return 1;
+    // 1) Cold load (should be MEM on first touch, or at least not guaranteed L1)
+    (void)load8(target);
+    print_level("cold target load (expect MEM or not-L1)");
+
+    // 2) Immediate reload (should be L1 hit)
+    (void)load8(target);
+    print_level("immediate reload (expect L1)");
+
+    // 3) Evict target from L1 by filling same set with 8+ other lines (same set via +4KiB stride)
+    for (int i = 1; i <= 8; i++) {
+        (void)load8(region + i * PAGE);
     }
 
-    memset((void*)thrash_l1, 1, L1_THRASH);
-    memset((void*)thrash_l2, 2, L2_THRASH);
-    ((volatile uint8_t*)target)[0] = 7;
+    // Reload target: should miss in L1; likely hit in L2 if L2 is inclusive/shared and big enough
+    (void)load8(target);
+    print_level("after L1 same-set eviction (expect L2)");
 
-    // 1) Cold access -> should be MEM (or at least not L1)
-    touch_byte(target);
-    print_level("cold target load (expect MEM)");
+    // 4) Thrash L2 heavily to force target to memory (simple large walk)
+    // Adjust size if needed; must exceed L2 capacity meaningfully.
+    size_t l2_thrash = 8 * 1024 * 1024;
+    volatile uint8_t *big = (volatile uint8_t*)aligned_alloc(PAGE, l2_thrash);
+    if (!big) return 1;
+    memset((void*)big, 1, l2_thrash);
 
-    // 2) Immediate re-access -> should be L1 hit
-    touch_byte(target);
-    print_level("immediate target reload (expect L1)");
+    for (size_t off = 0; off < l2_thrash; off += CACHELINE) {
+        (void)load8(big + off);
+    }
 
-    // 3) Evict from L1 but keep in L2 -> target reload should be L2 hit
-    thrash(thrash_l1, L1_THRASH);
-    touch_byte(target);
-    print_level("after L1 thrash, target reload (expect L2)");
+    (void)load8(target);
+    print_level("after L2 thrash (expect MEM)");
 
-    // 4) Evict from L2 too -> target reload should be MEM again
-    thrash(thrash_l2, L2_THRASH);
-    touch_byte(target);
-    print_level("after L2 thrash, target reload (expect MEM)");
-
-    free((void*)target);
-    free((void*)thrash_l1);
-    free((void*)thrash_l2);
+    free((void*)region);
+    free((void*)big);
     return 0;
 }
