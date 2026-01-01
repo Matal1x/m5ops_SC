@@ -28,6 +28,7 @@ static int m5op_eviction_test(const address_set_t *set,
     (void)tmp;
 
     uint64_t lvl = m5_get_last_hit_level();
+    printf("the m5op returned %d\n", lvl);
     return (lvl == 3); // 3 => miss/evicted, 1/2 => hit
 }
 
